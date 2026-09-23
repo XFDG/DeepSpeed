@@ -56,3 +56,27 @@
 1. `autodl-on` (retry on 无库存), SSH auto-connects in pane 0:5.0
 2. Deploy segment_ki.py / hybrid_engine_rollout.py / fused_glu.cu / e2e_attn_test.py via chunked base64; `rm -rf ~/.cache/torch_extensions/*/fused_glu*`
 3. Run commands 1–4 above; `shutdown now` when done
+
+## Tier 1/2 follow-up (same instance, later session)
+
+### Code Changes
+- `deepspeed/module_inject/segment_ki.py` — `_decode_attn_forward`: optional Tier 2 fast path (`op.triple_gemv` replaces the three q/k/v `F.linear` calls; gate split unchanged; enabled when `self._ki_qkv_op` set, `DS_TIER2=1` default). New `_tier12_layer_forward` + `install_tier12_norm(model, cuda_op)`: at b=1/seq_len=1 the post-attention residual-add + RMSNorm pair runs through `op.fused_add_norm` (kernel mutates attn-out in-place into the residual stream and returns the normalized MLP input); pre-attention norm and post-MLP add stay native (no add to fuse there). RMSNorm scale precomputed as bf16 `1+w` persistent buffer (HF multiplies by 1+weight, kernel by its weight arg directly). `DS_TIER1` env kill-switch. All 32 decoder layers patched (structural detection: block_type + two layernorms).
+- `deepspeed/runtime/rollout/hybrid_engine_rollout.py` — `_generate_graph` calls `install_tier12_norm(module, attn_op)` after `install_decode_attention`; stores `module._ki_tier12_patched`.
+- `e2e_tier12_test.py`, `tier12_check.py` (48-token fast text check) — new test scripts.
+
+### Debugging note
+First run degenerated to " Paris Paris Paris..." — variable-binding bug: `fused_add_norm` returns the NORMALIZED tensor while mutating arg 1 in-place into the residual stream; the final add was going through the normalized tensor instead of the residual stream. Fixed by keeping both handles (`new_residual` = mutated arg, `mlp_input` = return value). Bisected via `DS_TIER1`/`DS_TIER2` env switches (Tier2 alone was always correct).
+
+### Results (512 tok, greedy, 5 runs, Olympic avg)
+| Path | Olympic avg | tok/s | vs vLLM |
+|---|---|---|---|
+| DeepSpeed + decode_attn + Tier1 + Tier2 | 7.402 s | **69.2** | 92.4% |
+| (prior) DS + decode_attn only | 7.558 s | 67.7 | 88.8% |
+| vLLM (FLASH_ATTN, same instance) | — | 74.9 (128-tok bench) | 100% |
+
+- Tier1/2 gain: +2.2% (67.7 → 69.2); all-times ['7.387','7.387','7.387','7.434','7.433']
+- TEXT_OK: PASS (' Paris.\n\nThe capital of the United States…'); TIER12_PATCHED: 32, ATTN/QKV_PATCHED: 8/8
+- flake8 could not run in the local sandbox (multiprocessing SemLock denied); syntax-verified via ast.parse only
+
+### Transfer
+- chunked base64 via tmux: segment_ki.py (85b3aa8a8daf162891e02fe42ca894ad), hybrid_engine_rollout.py (646f02f506d66c7a8bcd7657a92dd75d), e2e_tier12_test.py (e7f25169d5ba7efdb6909b5099c0a0d8), tier12_check.py (7c101c9de72507929aad29a0a2304568) — all md5-verified

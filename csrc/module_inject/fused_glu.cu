@@ -10,9 +10,11 @@
 // single rounding to the storage dtype (torch opmath convention).
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <algorithm>
 
 #define SILU(x) ((x) / (1.0f + expf(-(x))))
 
@@ -547,6 +549,260 @@ void decode_attn(at::Tensor q,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ─── Tier 1: fused residual add + RMSNorm (b=1 decode) ───
+// One kernel replaces the two PyTorch ops per norm site (hidden += residual,
+// then RMSNorm(hidden) * weight). hidden is updated in-place to hold the new
+// residual stream; the normalized output is written to a separate tensor that
+// feeds the next sublayer. One thread block covers the whole row so the
+// sum-of-squares reduction stays block-local.
+__global__ void fused_add_norm_kernel(__nv_bfloat16* __restrict__ hidden,
+                                      const __nv_bfloat16* __restrict__ residual,
+                                      const __nv_bfloat16* __restrict__ weight,
+                                      __nv_bfloat16* __restrict__ out,
+                                      float eps,
+                                      int dim)
+{
+    extern __shared__ float s_data[];
+    __shared__ float s_reduce[32];
+
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < dim; i += n_threads) {
+        float h = __bfloat162float(hidden[i]) + __bfloat162float(residual[i]);
+        s_data[i] = h;
+        hidden[i] = __float2bfloat16_rn(h);
+        local_ss += h * h;
+    }
+
+    // Warp then cross-warp reduction of the sum of squares.
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_ss += __shfl_down_sync(0xffffffff, local_ss, offset);
+    int warp_id = tid >> 5;
+    if ((tid & 31) == 0) s_reduce[warp_id] = local_ss;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (tid < (n_threads >> 5)) ? s_reduce[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        if (tid == 0) s_reduce[0] = rsqrtf(v / dim + eps);
+    }
+    __syncthreads();
+    float rms = s_reduce[0];
+
+    for (int i = tid; i < dim; i += n_threads)
+        out[i] = __float2bfloat16_rn(s_data[i] * rms * __bfloat162float(weight[i]));
+}
+
+at::Tensor fused_add_norm(at::Tensor hidden, at::Tensor residual, at::Tensor weight, double eps)
+{
+    TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
+                "hidden/residual/weight must be CUDA bf16");
+    TORCH_CHECK(hidden.is_contiguous() && residual.is_contiguous() && weight.is_contiguous(),
+                "inputs must be contiguous");
+    int64_t rows = hidden.numel() / hidden.size(-1);
+    int dim = (int)hidden.size(-1);
+    TORCH_CHECK(residual.numel() == hidden.numel() && weight.numel() == dim, "shape mismatch");
+    TORCH_CHECK((int64_t)dim * sizeof(float) <= 48 * 1024,
+                "dim too large for one-block shared memory: ",
+                dim);
+    auto out = at::empty_like(hidden);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int threads = std::min(1024, ((dim + 31) / 32) * 32);
+    if (threads == 0) threads = 32;
+    fused_add_norm_kernel<<<(int)rows, threads, (size_t)dim * sizeof(float), stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(hidden.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        (float)eps,
+        dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// ─── Tier 2: triple-weight QKV GEMV (b=1 decode) ───
+// Reads q_proj/k_proj/v_proj weights directly — no concat, no weight copies
+// (Plan B style, gradient-safe). One warp per output row across all three
+// matrices, so a single launch covers the whole QKV projection.
+__global__ void triple_gemv_kernel(const __nv_bfloat16* __restrict__ hidden,
+                                   const __nv_bfloat16* __restrict__ q_w,
+                                   const __nv_bfloat16* __restrict__ k_w,
+                                   const __nv_bfloat16* __restrict__ v_w,
+                                   __nv_bfloat16* __restrict__ q_out,
+                                   __nv_bfloat16* __restrict__ k_out,
+                                   __nv_bfloat16* __restrict__ v_out,
+                                   int q_out_f,
+                                   int kv_out_f,
+                                   int in_f)
+{
+    int total_rows = q_out_f + 2 * kv_out_f;
+    for (int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; warp_id < total_rows;
+         warp_id += (gridDim.x * blockDim.x) >> 5) {
+        int lane = threadIdx.x & 31;
+        const __nv_bfloat16* w_ptr;
+        __nv_bfloat16* out_ptr;
+        int row;
+        if (warp_id < q_out_f) {
+            w_ptr = q_w;
+            out_ptr = q_out;
+            row = warp_id;
+        } else if (warp_id < q_out_f + kv_out_f) {
+            w_ptr = k_w;
+            out_ptr = k_out;
+            row = warp_id - q_out_f;
+        } else {
+            w_ptr = v_w;
+            out_ptr = v_out;
+            row = warp_id - q_out_f - kv_out_f;
+        }
+
+        float acc = 0.0f;
+        for (int i = lane; i < in_f; i += 32)
+            acc += __bfloat162float(hidden[i]) * __bfloat162float(w_ptr[(long)row * in_f + i]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        if (lane == 0) out_ptr[row] = __float2bfloat16_rn(acc);
+    }
+}
+
+std::vector<at::Tensor> triple_gemv(at::Tensor hidden,
+                                    at::Tensor q_w,
+                                    at::Tensor k_w,
+                                    at::Tensor v_w)
+{
+    TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
+                "hidden must be CUDA bf16");
+    TORCH_CHECK(q_w.is_contiguous() && k_w.is_contiguous() && v_w.is_contiguous(),
+                "weights must be contiguous");
+    TORCH_CHECK(q_w.size(1) == k_w.size(1) && k_w.size(1) == v_w.size(1),
+                "in_features must match across q/k/v");
+    int q_out_f = (int)q_w.size(0);
+    int kv_out_f = (int)k_w.size(0);
+    TORCH_CHECK(v_w.size(0) == kv_out_f, "v/k weight shapes must match");
+    int in_f = (int)q_w.size(1);
+    auto q_out = at::empty({q_out_f}, hidden.options());
+    auto k_out = at::empty({kv_out_f}, hidden.options());
+    auto v_out = at::empty({kv_out_f}, hidden.options());
+    int total_rows = q_out_f + 2 * kv_out_f;
+    int warps_per_block = 8;
+    int blocks = (total_rows + warps_per_block - 1) / warps_per_block;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    triple_gemv_kernel<<<blocks, warps_per_block * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(q_w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k_w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(v_w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(v_out.data_ptr<at::BFloat16>()),
+        q_out_f,
+        kv_out_f,
+        in_f);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q_out, k_out, v_out};
+}
+
+// ─── Tier 3: MLP megakernel (b=1 decode) ───
+// Entire MLP forward in one launch: gate/up GEMV + silu_mul, grid sync, down
+// GEMV. Reads the three original weights directly (no concat). The gate|up
+// intermediate lives in a tiny global scratch ([inter], 18 KB bf16) — the
+// point of this tier is to measure whether removing one kernel boundary and
+// the intermediate round-trip matters at all, since the 141 MB/layer weight
+// traffic dominates. Requires cooperative launch (grid-wide sync).
+__global__ void mlp_megakernel(const __nv_bfloat16* __restrict__ hidden,
+                               const __nv_bfloat16* __restrict__ gate_w,
+                               const __nv_bfloat16* __restrict__ up_w,
+                               const __nv_bfloat16* __restrict__ down_w,
+                               __nv_bfloat16* __restrict__ scratch,
+                               __nv_bfloat16* __restrict__ out,
+                               int in_f,
+                               int inter)
+{
+    int lane = threadIdx.x & 31;
+    int total_warps = (gridDim.x * blockDim.x) >> 5;
+
+    // Phase 1: gate|up GEMV rows with fused silu_mul (same access pattern as
+    // dual_gemv_silu_mul), scattered across every warp in the grid.
+    for (int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; row < inter; row += total_warps) {
+        const __nv_bfloat16* gate_row = gate_w + (long)row * in_f;
+        const __nv_bfloat16* up_row = up_w + (long)row * in_f;
+        float gate_acc = 0.0f, up_acc = 0.0f;
+        for (int i = lane; i < in_f; i += 32) {
+            float h = __bfloat162float(hidden[i]);
+            gate_acc += h * __bfloat162float(gate_row[i]);
+            up_acc += h * __bfloat162float(up_row[i]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_acc += __shfl_down_sync(0xffffffff, gate_acc, offset);
+            up_acc += __shfl_down_sync(0xffffffff, up_acc, offset);
+        }
+        if (lane == 0) scratch[row] = __float2bfloat16_rn(SILU(gate_acc) * up_acc);
+    }
+
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    grid.sync();
+
+    // Phase 2: down_proj GEMV, one warp per output feature.
+    for (int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; row < in_f; row += total_warps) {
+        const __nv_bfloat16* down_row = down_w + (long)row * inter;
+        float acc = 0.0f;
+        for (int i = lane; i < inter; i += 32)
+            acc += __bfloat162float(scratch[i]) * __bfloat162float(down_row[i]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        if (lane == 0) out[row] = __float2bfloat16_rn(acc);
+    }
+}
+
+at::Tensor mlp_megakernel_forward(at::Tensor hidden,
+                                  at::Tensor gate_w,
+                                  at::Tensor up_w,
+                                  at::Tensor down_w,
+                                  at::Tensor scratch)
+{
+    TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
+                "hidden must be CUDA bf16");
+    TORCH_CHECK(gate_w.is_contiguous() && up_w.is_contiguous() && down_w.is_contiguous(),
+                "weights must be contiguous");
+    int in_f = (int)hidden.size(-1);
+    int inter = (int)gate_w.size(0);
+    TORCH_CHECK(up_w.size(0) == inter && gate_w.size(1) == in_f && down_w.size(0) == in_f &&
+                    down_w.size(1) == inter,
+                "weight shape mismatch");
+    TORCH_CHECK(scratch.numel() >= inter, "scratch must hold [inter] elements");
+    auto out = at::empty({in_f}, hidden.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, hidden.get_device());
+    int max_blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, mlp_megakernel, warps_per_block * 32, 0);
+    int grid = sm_count * max_blocks_per_sm;
+    grid = std::min(grid, (inter + warps_per_block - 1) / warps_per_block);
+
+    const __nv_bfloat16* h_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* g_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(gate_w.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* u_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(up_w.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* d_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(down_w.data_ptr<at::BFloat16>());
+    __nv_bfloat16* s_ptr = reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr<at::BFloat16>());
+    __nv_bfloat16* o_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+    void* kernel_args[] = {&h_ptr, &g_ptr, &u_ptr, &d_ptr, &s_ptr, &o_ptr, &in_f, &inter};
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (void*)mlp_megakernel, dim3(grid), dim3(threads), kernel_args, 0, stream.stream());
+    TORCH_CHECK(
+        err == cudaSuccess, "mlp_megakernel cooperative launch failed: ", cudaGetErrorString(err));
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("decode_attn", &decode_attn, "b=1 decode attention with GQA, graph-compatible (CUDA)");
@@ -559,4 +815,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dual_gemv_silu_mul",
           &dual_gemv_silu_mul,
           "b=1 GEMV reading gate/up weights separately: silu(h*Wg)*(h*Wu) (CUDA)");
+    m.def("fused_add_norm",
+          &fused_add_norm,
+          "fused residual add + RMSNorm, in-place residual update (CUDA)");
+    m.def("triple_gemv",
+          &triple_gemv,
+          "b=1 QKV GEMV reading q/k/v weights directly, no concat (CUDA)");
+    m.def(
+        "mlp_megakernel_forward",
+        &mlp_megakernel_forward,
+        "b=1 MLP megakernel: gate/up GEMV + silu_mul + down GEMV in one cooperative launch (CUDA)");
 }

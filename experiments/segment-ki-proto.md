@@ -872,3 +872,43 @@ FLA 快速路径改善的是核心计算，但核心计算本来就很小。
 - GEMV kernel 效率（cuBLAS vs vLLM 自定义）：~2-3%
 - Graph 内 kernel 间隙/调度：~3-4%
 - Prefill 差异（eager vs chunked）：~2-3%
+
+## Batch 复测：跨实例不可复现 (2026-09-22)
+
+同代码两次测试对比：
+| b | Session A (前) | Session B (复测) | 差异 |
+|---|---|---|---|
+| 1 | 68.2 | 66.2 | -3% |
+| 2 | 124.6 | 119.5 | -4% |
+| 4 | **499.9** | **224.4** | **-55%** |
+| 8 | **738.5** | **406.0** | **-45%** |
+
+b=1/2 跨实例稳定（±3-4%），b=4/8 剧烈波动（-45~-55%）。
+前一轮的"超线性 batch scaling"（b=4 per-seq 125 tok/s）**不可复现**。
+
+本 session（稳定实例）的正确结论：
+| b | DS total | vLLM total (上轮) | 比率 |
+|---|---|---|---|
+| 1 | 66.2 | 76.1 | 0.87× |
+| 2 | 119.5 | 144.3 | 0.83× |
+| 4 | 224.4 | 281.1 | 0.80× |
+| 8 | 406.0 | 535.4 | 0.76× |
+
+Batch scaling 接近线性（总吞吐 ~3.4× for 4× batch，sub-linear 但合理）。
+per-seq 递减 25%（b=1→8）为 memory-bound decode 的正常行为。
+
+⚠️ 教训：batch > 1 的性能高度依赖实例状态（GPU 时钟/温度/分配），
+单次测量不可作为结论。可靠的 batch 对比需要在同一实例同一 session
+内跑完所有 batch size + vLLM 对照。之前 Session A 的 b=4/8 数据
+（499.9/738.5）可能是 GPU boost 时钟下的瞬时峰值，不可复现。
+
+## Tier 1/2 E2E 首测（未集成，仅编译部署）(2026-09-22)
+
+Tier 1/2 kernel 已编译部署但尚未集成到 decode 路径（模型内部仍调用
+原始 norm/QKV）。E2E 65.9 tok/s ≈ baseline（实例差异范围内）。
+vLLM 同实例 72.3 tok/s（128 tok 口径）。
+
+**待做**：将 fused_add_norm 和 triple_gemv 接入 graph capture 内的
+模型 forward——需要在 attention 层和 MLP 层替换内部调用，工作量
+与 segKI 的 forward replacement 相当。替换后预期 E2E 提升见微基准：
+Tier 1 省 ~351μs/step (2.3%) + Tier 2 省 ~240μs/step (1.6%) = ~3.9%

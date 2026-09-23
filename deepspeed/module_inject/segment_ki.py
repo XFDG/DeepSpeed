@@ -27,6 +27,7 @@ the same pattern serves every family that lays out its MLP as
 gate_proj/up_proj/down_proj.
 """
 
+import os
 from dataclasses import dataclass
 from typing import List
 
@@ -442,12 +443,27 @@ def _decode_attn_forward(self,
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
-    gate = gate.reshape(*input_shape, -1)
+    qkv_op = getattr(self, "_ki_qkv_op", None)
+    if qkv_op is not None:
+        # Tier 2: one GEMV launch over q/k/v weights directly — replaces the
+        # three separate F.linear launches. q_proj keeps its 2x-wide
+        # query|gate layout, so the gate split below is unchanged from HF.
+        q_out, k_out, v_out = qkv_op.triple_gemv(hidden_states.view(-1), self.q_proj.weight, self.k_proj.weight,
+                                                 self.v_proj.weight)
+        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+        gate = gate.reshape(*input_shape, -1)
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(k_out.view(hidden_shape)).transpose(1, 2)
+        value_states = v_out.view(hidden_shape).transpose(1, 2)
+    else:
+        query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
+                                         2,
+                                         dim=-1)
+        gate = gate.reshape(*input_shape, -1)
 
-    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
     query_states, key_states = self._ki_rope(query_states, key_states, cos, sin)
@@ -500,11 +516,97 @@ def install_decode_attention(model: torch.nn.Module, write_pos: torch.Tensor, cu
         if getattr(module, "_ki_orig_attn_forward", None) is None:
             module._ki_orig_attn_forward = module.forward
         module._ki_attn_op = cuda_op
+        module._ki_qkv_op = cuda_op if (hasattr(cuda_op, "triple_gemv")
+                                        and os.environ.get("DS_TIER2", "1") == "1") else None
         module._ki_write_pos = write_pos
         module._ki_rope = apply_rotary_pos_emb
         module._ki_num_q_heads = num_q_heads
         module._ki_num_kv_heads = num_kv_heads
         module.forward = _decode_attn_forward.__get__(module, type(module))
+        patched += 1
+    return patched
+
+
+# ─── Tier 1: fused residual-add + RMSNorm in the decoder-layer forward ───
+
+
+def _tier12_layer_forward(self,
+                          hidden_states,
+                          position_embeddings,
+                          attention_mask=None,
+                          position_ids=None,
+                          past_key_values=None,
+                          **kwargs):
+    """Replacement forward for decoder layers at b=1, seq_len=1: the
+    post-attention residual-add + RMSNorm pair runs through the
+    fused_add_norm kernel (one launch updates the residual stream in-place
+    and produces the normalized MLP input) instead of two launches. The
+    pre-attention norm stays native — the HF layer normifies the raw hidden
+    state there, with no add to fuse — and the final post-MLP add stays a
+    plain add for the same reason. Attention and MLP are called unchanged,
+    so attention-level patches (decode_attn / triple_gemv) still apply."""
+    if (hidden_states.shape[0] != 1 or hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16
+            or not hidden_states.is_contiguous() or getattr(self, "_ki_norm_op", None) is None):
+        # Prefill, batched decode, or a non-graph path: the original forward
+        # is the correct path.
+        return self._ki_orig_layer_forward(hidden_states, position_embeddings, attention_mask, position_ids,
+                                           past_key_values, **kwargs)
+
+    op = self._ki_norm_op
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+
+    if self.block_type == "linear_attention":
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+    else:
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    # fused_add_norm mutates its first argument in-place into the new
+    # residual stream and returns the normalized input to the MLP — keep
+    # both handles, the final add must go through the residual stream.
+    new_residual = hidden_states
+    mlp_input = op.fused_add_norm(new_residual, residual, self._ki_postattn_scale, self.post_attention_layernorm.eps)
+    hidden_states = self.mlp(mlp_input)
+    hidden_states = hidden_states + new_residual
+
+    return hidden_states
+
+
+def install_tier12_norm(model: torch.nn.Module, cuda_op) -> int:
+    """Patch decoder layers to use fused_add_norm at b=1 decode.
+
+    Detection is structural (block_type + mlp + both layernorms), so it
+    covers full-attention and linear-attention layers alike. Pre-computes
+    the 1+w RMSNorm scale into a persistent contiguous buffer (the HF norm
+    multiplies by 1+weight; the kernel multiplies by its weight argument
+    directly) so the captured graph never rebuilds it. Returns the patched
+    count."""
+    if cuda_op is None or not hasattr(cuda_op, "fused_add_norm") or os.environ.get("DS_TIER1", "1") != "1":
+        return 0
+    patched = 0
+    for module in model.modules():
+        norms = [getattr(module, name, None) for name in ("input_layernorm", "post_attention_layernorm")]
+        if not all(isinstance(n, torch.nn.Module) and hasattr(n, "weight") and hasattr(n, "eps") for n in norms):
+            continue
+        if getattr(module, "block_type", None) not in ("linear_attention", "full_attention"):
+            continue
+        if getattr(module, "_ki_orig_layer_forward", None) is None:
+            module._ki_orig_layer_forward = module.forward
+        module._ki_norm_op = cuda_op
+        module._ki_postattn_scale = torch.add(1.0, norms[1].weight.detach()).contiguous()
+        module.forward = _tier12_layer_forward.__get__(module, type(module))
         patched += 1
     return patched
 

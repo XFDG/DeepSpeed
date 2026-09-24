@@ -4,7 +4,7 @@
 // DeepSpeed Team
 
 // Native CUDA kernel for the segment-KI fused_glu op: computes
-// out = silu(hidden[:, :k]) * hidden[:, k:2k] on the fused gate/up GEMM
+// out = silu(hidden[:, :k]) * hidden[:, k:2k] on the fused gate|up GEMM
 // output without materializing chunked views. hidden is contiguous
 // [N, 2k]; out is contiguous [N, k]. Activation math runs in fp32 with a
 // single rounding to the storage dtype (torch opmath convention).
@@ -48,7 +48,7 @@ __global__ void silu_mul_halves_bf16(const __nv_bfloat16* __restrict__ hidden,
 
 at::Tensor fused_silu_mul_halves(at::Tensor hidden) {
     TORCH_CHECK(hidden.is_cuda(), "fused_silu_mul_halves is CUDA-only");
-    TORCH_CHECK(hidden.dim() >= 1 && hidden.size(-1) % 2 == 0, "last dim must be even (gate/up layout)");
+    TORCH_CHECK(hidden.dim() >= 1 && hidden.size(-1) % 2 == 0, "last dim must be even (gate|up layout)");
     TORCH_CHECK(hidden.is_contiguous(), "hidden must be contiguous");
     auto sizes = hidden.sizes().vec();
     sizes.back() /= 2;
@@ -324,7 +324,7 @@ void dual_gemv_silu_mul(at::Tensor hidden,
                 "hidden must be CUDA bf16");
     TORCH_CHECK(gate_w.is_contiguous() && up_w.is_contiguous(), "weights must be contiguous");
     TORCH_CHECK(gate_w.size(0) == up_w.size(0) && gate_w.size(1) == up_w.size(1),
-                "gate/up weight shapes must match");
+                "gate|up weight shapes must match");
     int out_f = (int)gate_w.size(0);
     int in_f = (int)gate_w.size(1);
     int warps_per_block = 8;  // 256 threads
@@ -644,8 +644,8 @@ std::vector<at::Tensor> triple_gemv(at::Tensor hidden, at::Tensor q_w, at::Tenso
 }
 
 // ─── Tier 3: MLP megakernel (b=1 decode) ───
-// Entire MLP forward in one launch: gate/up GEMV + silu_mul, grid sync, down
-// GEMV. Reads the three original weights directly (no concat). The gate/up
+// Entire MLP forward in one launch: gate|up GEMV + silu_mul, grid sync, down
+// GEMV. Reads the three original weights directly (no concat). The gate|up
 // intermediate lives in a tiny global scratch ([inter], 18 KB bf16) — the
 // point of this tier is to measure whether removing one kernel boundary and
 // the intermediate round-trip matters at all, since the 141 MB/layer weight
@@ -661,7 +661,7 @@ __global__ void mlp_megakernel(const __nv_bfloat16* __restrict__ hidden,
     int lane = threadIdx.x & 31;
     int total_warps = (gridDim.x * blockDim.x) >> 5;
 
-    // Phase 1: gate/up GEMV rows with fused silu_mul (same access pattern as
+    // Phase 1: gate|up GEMV rows with fused silu_mul (same access pattern as
     // dual_gemv_silu_mul), scattered across every warp in the grid.
     for (int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; row < inter; row += total_warps) {
         const __nv_bfloat16* gate_row = gate_w + (long)row * in_f;
@@ -738,9 +738,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
     m.def("fused_silu_mul_halves", &fused_silu_mul_halves, "fused silu(gate)*up on [N, 2k] hidden (CUDA)");
     m.def("dual_gemv_silu_mul", &dual_gemv_silu_mul,
-          "b=1 GEMV reading gate/up weights separately: silu(h*Wg)*(h*Wu) (CUDA)");
+          "b=1 GEMV reading gate|up weights separately: silu(h*Wg)*(h*Wu) (CUDA)");
     m.def("fused_add_norm", &fused_add_norm, "fused residual add + RMSNorm, in-place residual update (CUDA)");
     m.def("triple_gemv", &triple_gemv, "b=1 QKV GEMV reading q/k/v weights directly, no concat (CUDA)");
     m.def("mlp_megakernel_forward", &mlp_megakernel_forward,
-          "b=1 MLP megakernel: gate/up GEMV + silu_mul + down GEMV in one cooperative launch (CUDA)");
+          "b=1 MLP megakernel: gate|up GEMV + silu_mul + down GEMV in one cooperative launch (CUDA)");
 }

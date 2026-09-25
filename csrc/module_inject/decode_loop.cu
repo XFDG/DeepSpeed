@@ -2,16 +2,17 @@
 // DeepSpeed Team
 
 // C++ decode loop: runs the full generation loop in a single C++ call.
-// The CUDA graph is accepted as a py::object; its replay() method is invoked
-// from C++ via pybind11 (bypassing the Python for-loop while reusing the
-// same graph object that was captured on the Python side).
+// The replay callable is a std::function<void()> — it can wrap a CUDA
+// graph replay, a SYCL submission, an eager PyTorch forward, or any
+// backend-specific mechanism. The C++ loop is agnostic to the backend.
 //
-// Per-step overhead: graph.attr("replay")() ≈ 2-5μs (pybind11 dispatch)
-// vs Python graph.replay() ≈ 10-15μs + loop overhead ≈ 30μs.
+// Per-step overhead: replay_fn() ≈ 2-5μs (pybind11 dispatch)
+// vs Python for-loop ≈ 30-50μs.
 // The fused step-update kernel launch is pure C++ (zero Python).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <functional>
 #include <cuda_runtime.h>
 
 __global__ void ds_loop_step_kernel(const __nv_bfloat16* __restrict__ logits,
@@ -62,7 +63,7 @@ __global__ void ds_loop_step_kernel(const __nv_bfloat16* __restrict__ logits,
     }
 }
 
-int64_t ds_decode_loop(py::object graph,
+int64_t ds_decode_loop(std::function<void()> replay_fn,
                        at::Tensor logits,
                        at::Tensor token_out,
                        at::Tensor write_pos,
@@ -98,13 +99,11 @@ int64_t ds_decode_loop(py::object graph,
     bool* mask_ptr = mask.data_ptr<bool>();
     int64_t* buf_ptr = out_buf_1d.data_ptr<int64_t>();
 
-    // Cache the replay method once (avoids repeated attribute lookup)
-    py::object replay_fn = graph.attr("replay");
-
     int64_t steps_done = 0;
 
     for (int64_t step = 1; step < max_steps; step++) {
-        // 1) Replay the captured forward pass via pybind11 method call
+        // 1) Invoke the replay callable (graph replay, eager forward, or
+        // any backend-specific mechanism — the C++ loop is agnostic)
         replay_fn();
 
         // 2) Fused step-update kernel (pure C++, zero Python)
@@ -135,7 +134,7 @@ int64_t ds_decode_loop(py::object graph,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_loop", &ds_decode_loop,
           "C++ decode loop: graph replay + step update, zero Python per step",
-          py::arg("graph"), py::arg("logits"), py::arg("token_out"),
+          py::arg("replay_fn"), py::arg("logits"), py::arg("token_out"),
           py::arg("write_pos"), py::arg("mask"), py::arg("out_buf"),
           py::arg("max_steps"), py::arg("eos_token_id"),
           py::arg("pad_token_id"), py::arg("eos_check_every"));

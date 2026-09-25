@@ -428,7 +428,21 @@ class HybridEngineRollout(RolloutEngine):
         token_buf[0] = next_token.squeeze(0)[0] if batch_size == 1 else next_token[0, 0]
 
         if loop_op is not None and hasattr(loop_op, "decode_loop"):
-            loop_op.decode_loop(graph, static_logits[:, -1, :].contiguous(), static_token,
+            # Construct the replay callable: use the graph's bound method if a
+            # graph was captured; otherwise fall back to an eager forward
+            # (accelerator without graph support, or capture failure).
+            if graph is not None:
+                replay_fn = graph.replay
+            else:
+
+                def replay_fn():
+                    module(static_token,
+                           attention_mask={"full_attention": static_attn,
+                                           "linear_attention": None},
+                           past_key_values=ds_cache,
+                           use_cache=True)
+
+            loop_op.decode_loop(replay_fn, static_logits[:, -1, :].contiguous(), static_token,
                                 write_pos, static_attn, token_buf, max_new_tokens,
                                 eos_token_id if eos_token_id is not None else -1,
                                 pad_token_id if pad_token_id is not None else 0, 16)
